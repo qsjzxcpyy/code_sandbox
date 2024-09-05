@@ -1,4 +1,4 @@
-package com.qsj.acoj.judge.codesandbox.model;
+package com.qsj.acojcodesandbox.model;
 
 import lombok.Data;
 
@@ -18,3 +18,4 @@ public class JudgeInfo {
     private Long time;
 
 }
+

@@ -1,4 +1,4 @@
-package com.qsj.acoj.judge.codesandbox.model;
+package com.qsj.acojcodesandbox.model;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -23,7 +23,7 @@ public class ExecuteCodeResponse {
     /**
      * 执行状态
      */
-    private String statue;
+    private Integer statue;
     /**
      * 判题信息
      */

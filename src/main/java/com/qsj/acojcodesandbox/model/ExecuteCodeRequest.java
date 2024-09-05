@@ -1,4 +1,4 @@
-package com.qsj.acoj.judge.codesandbox.model;
+package com.qsj.acojcodesandbox.model;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
