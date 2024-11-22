@@ -1,5 +1,4 @@
 package com.qsj.acojcodesandbox;
-
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.StrUtil;
 import com.qsj.acojcodesandbox.model.Eums.ExecuteCodeMessageEum;
@@ -12,13 +11,12 @@ import org.springframework.stereotype.Component;
 import oshi.SystemInfo;
 import oshi.software.os.OSProcess;
 import oshi.software.os.OperatingSystem;
-
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+
+
 @Component
 public class JavaNativeCodeSandbox implements CodeSandbox {
     private static final String GLOBAL_CODE_DIR_NAME = "tmpCode";
@@ -63,30 +61,20 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
         for (String inputArg : inputList) {
             String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main", userCodeParentPath);
             try {
+                // 先启动进程
                 Process runProcess = Runtime.getRuntime().exec(runCmd);
 
+                // 创建内存跟踪器并传入进程
                 MemoryTracker memoryTracker = new MemoryTracker(runProcess);
                 memoryTracker.start();
 
-                final ExecuteMessage[] runMessage = {ProcessUtils.runInteractProcessAndGetMessage(runProcess, inputArg)};
+                // 执行进程并获取结果
+                ExecuteMessage runMessage = ProcessUtils.runInteractProcessAndGetMessage(runProcess, inputArg);
 
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(TIME_OUT);
-                        if (runProcess.isAlive()) {
-                            runProcess.destroy();
-                            runMessage[0].setTime(1000000L);
-                            runMessage[0].setMemory(memoryTracker.getMaxMemoryUsage());
-                            runMessage[0].setErrorMessage("运行超时");
-                        }
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }).start();
+                // 停止监控并获取结果
                 memoryTracker.stop();
-                runMessage[0].setMemory(memoryTracker.getMaxMemoryUsage());
-                executeMessageList.add(runMessage[0]);
-
+                runMessage.setMemory(memoryTracker.getMaxMemoryUsage());
+                executeMessageList.add(runMessage);
             } catch (Exception e) {
                 return getErrorResponse(e);
             }
@@ -133,82 +121,140 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
     public class MemoryTracker {
         private final Process process;
         private long maxMemoryUsage = 0;
-        private final Timer timer = new Timer();
-        private final SystemInfo systemInfo = new SystemInfo();
-        private final OperatingSystem os = systemInfo.getOperatingSystem();
+        private volatile boolean isRunning = true;
+        private Thread monitorThread;
+        private final SystemInfo systemInfo;
+        private final OperatingSystem os;
+        private Long processId = null;
+        private final long startTime;
+        private volatile boolean hasStartedMonitoring = false;
 
         public MemoryTracker(Process process) {
             this.process = process;
+            this.systemInfo = new SystemInfo();
+            this.os = systemInfo.getOperatingSystem();
+            this.startTime = System.currentTimeMillis();
+        }
+
+        private void findJavaProcess() {
+            // 获取所有Java进程
+            List<OSProcess> processes = os.getProcesses();
+
+            // 按启动时间倒序排序
+            processes.sort((p1, p2) -> Long.compare(p2.getStartTime(), p1.getStartTime()));
+
+            for (OSProcess process : processes) {
+                String cmd = process.getCommandLine();
+                // 找到最近启动的包含Main的Java进程
+                if (cmd != null && cmd.contains("java") && cmd.contains("Main")
+                        && process.getStartTime() >= startTime - 1000) { // 允许1秒的时间误差
+                    processId = (long) process.getProcessID();
+                    System.out.println("找到目标进程 - PID: " + processId
+                            + ", 启动时间: " + process.getStartTime()
+                            + ", 命令行: " + cmd);
+                    return;
+                }
+            }
+            System.out.println("未找到目标进程");
         }
 
         public void start() {
-            timer.scheduleAtFixedRate(new TimerTask() {
-                @Override
-                public void run() {
-                    try {
-                        long pid = getProcessId();
-                        maxMemoryUsage = Math.max(maxMemoryUsage, getMemoryUsage(pid));
-                    } catch (Exception e) {
-                        e.printStackTrace();
+            // 确保进程已经启动
+            try {
+                Thread.sleep(50);
+                findJavaProcess();
+            } catch (Exception e) {
+                System.out.println("初始化内存跟踪器失败: " + e.getMessage());
+                return;
+            }
+
+            monitorThread = new Thread(() -> {
+                try {
+                    if (processId != null) {
+                        System.out.println("开始监控进程内存，进程ID: " + processId);
+                        int retryCount = 0;
+
+                        while (isRunning && process.isAlive() && retryCount < 10) { // 增加重试次数
+                            try {
+                                OSProcess osProcess = os.getProcess((int) (long) processId);
+                                if (osProcess != null) {
+                                    long currentMemory = osProcess.getResidentSetSize() / 1024;
+                                    if (currentMemory > 0) {
+                                        hasStartedMonitoring = true;
+                                        System.out.println("当前物理内存使用: " + formatMemorySize(currentMemory));
+                                        maxMemoryUsage = Math.max(maxMemoryUsage, currentMemory);
+                                        retryCount = 0; // 重置重试计数
+                                    } else {
+                                        retryCount++;
+                                    }
+                                } else {
+                                    retryCount++;
+                                }
+                                Thread.sleep(10); // 缩短采样间隔
+                            } catch (Exception e) {
+                                System.out.println("内存采样异常: " + e.getMessage());
+                                retryCount++;
+                            }
+                        }
+
+                        if (!hasStartedMonitoring) {
+                            System.out.println("未能成功监控到进程内存使用");
+                        }
+                    } else {
+                        System.out.println("无法获取进程ID，内存监控失败");
                     }
+                } catch (Exception e) {
+                    System.out.println("内存监控线程异常: " + e.getMessage());
+                    e.printStackTrace();
                 }
-            }, 0, 1000); // 每秒检查一次内存
+            });
+            monitorThread.start();
         }
 
         public void stop() {
-            timer.cancel();
+            try {
+                // 确保监控线程有足够的时间收集数据
+                if (!hasStartedMonitoring) {
+                    Thread.sleep(200);
+                }
+
+                if (processId != null) {
+                    // 在停止前多次采样
+                    for (int i = 0; i < 10; i++) {
+                        OSProcess osProcess = os.getProcess((int) (long) processId);
+                        if (osProcess != null) {
+                            long currentMemory = osProcess.getResidentSetSize() / 1024;
+                            if (currentMemory > 0) {
+                                maxMemoryUsage = Math.max(maxMemoryUsage, currentMemory);
+                            }
+                        }
+                        Thread.sleep(10);
+                    }
+                }
+
+                isRunning = false;
+                if (monitorThread != null) {
+                    monitorThread.join(1000);
+                }
+                System.out.println("内存监控结束，最大物理内存使用: " + formatMemorySize(maxMemoryUsage));
+            } catch (Exception e) {
+                System.out.println("停止内存监控时发生异常: " + e.getMessage());
+            }
         }
 
         public long getMaxMemoryUsage() {
             return maxMemoryUsage;
         }
 
-        private long getProcessId() throws Exception {
-            // JDK 8 的进程 ID 获取方式
-            if (System.getProperty("os.name").toLowerCase().startsWith("windows")) {
-                return getProcessIdWindows(process);
+        private String formatMemorySize(long sizeInKB) {
+            if (sizeInKB < 1024) {
+                return sizeInKB + " KB";
+            } else if (sizeInKB < 1024 * 1024) {
+                return String.format("%.2f MB", sizeInKB / 1024.0);
             } else {
-                return getProcessIdLinux(process);
+                return String.format("%.2f GB", sizeInKB / (1024.0 * 1024.0));
             }
-        }
-
-        private  long getProcessIdWindows(Process process) throws Exception {
-            // 通过 WMIC 命令获取 Windows 系统上的进程 ID
-            Process taskListProcess = Runtime.getRuntime().exec("tasklist /FI \"IMAGENAME eq java.exe\"");
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(taskListProcess.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.contains("java.exe")) {
-                        String[] parts = line.trim().split("\\s+");
-                        return Long.parseLong(parts[1]);
-                    }
-                }
-            }
-            throw new RuntimeException("无法确定进程ID.");
-        }
-
-        private  long getProcessIdLinux(Process process) throws Exception {
-            // 通过 pgrep 命令获取 Linux 系统上的进程 ID
-            Process pgrepProcess = Runtime.getRuntime().exec("pgrep -f java");
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(pgrepProcess.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    return Long.parseLong(line.trim());
-                }
-            }
-            throw new RuntimeException("无法确定进程ID.");
-        }
-
-        private long getMemoryUsage(long pid) {
-            // 使用 OSHI 获取进程内存使用情况
-            OSProcess osProcess = os.getProcess((int) pid);
-            if (osProcess != null) {
-                // 返回 RSS 内存，以 KB 为单位
-                return osProcess.getResidentSetSize() / 1024;
-            }
-            return 0;
         }
     }
-
 
 }
