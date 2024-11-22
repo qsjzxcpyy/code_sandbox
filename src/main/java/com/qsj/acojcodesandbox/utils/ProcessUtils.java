@@ -80,36 +80,72 @@ public class ProcessUtils {
         ExecuteMessage executeMessage = new ExecuteMessage();
         StopWatch stopWatch = new StopWatch();
         stopWatch.start();
+
+        OutputStream outputStream = null;
+        OutputStreamWriter outputStreamWriter = null;
+        InputStream inputStream = null;
+        BufferedReader bufferedReader = null;
+        List<String> outPutMessage = new ArrayList<>();
+
         try {
             // 向控制台输入程序
-            OutputStream outputStream = runProcess.getOutputStream();
-            OutputStreamWriter outputStreamWriter = new OutputStreamWriter(outputStream);
+            outputStream = runProcess.getOutputStream();
+            outputStreamWriter = new OutputStreamWriter(outputStream);
             String[] s = args.split(" ");
             String join = StrUtil.join("\n", s) + "\n";
             outputStreamWriter.write(join);
             // 相当于按了回车，执行输入的发送
             outputStreamWriter.flush();
-            runProcess.waitFor();
+
             // 分批获取进程的正常输出
-            InputStream inputStream = runProcess.getInputStream();
-            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(inputStream));
-            List<String> outPutMessage = new ArrayList<>();
+            inputStream = runProcess.getInputStream();
+            bufferedReader = new BufferedReader(new InputStreamReader(inputStream));
             // 逐行读取
             String OutputLine;
             while ((OutputLine = bufferedReader.readLine()) != null) {
-                    outPutMessage.add(OutputLine);
+                outPutMessage.add(OutputLine);
             }
+
+            // 等待程序执行结束
+            runProcess.waitFor();
+
             stopWatch.stop();
             long lastTaskTimeMillis = stopWatch.getLastTaskTimeMillis();
             executeMessage.setMessage(StringUtils.join(outPutMessage, " "));
             executeMessage.setTime(lastTaskTimeMillis);
-            // 记得资源的释放，否则会卡死
-            outputStreamWriter.close();
-            outputStream.close();
-            inputStream.close();
-            runProcess.destroy();
+
+        } catch (IOException e) {
+            // Stream closed 异常不处理
+            if (!e.getMessage().contains("Stream closed")) {
+                stopWatch.stop();
+                executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
+            }
         } catch (Exception e) {
-            e.printStackTrace();
+            stopWatch.stop();
+            executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
+            executeMessage.setMessage(StringUtils.join(outPutMessage, " "));
+            executeMessage.setErrorMessage(e.getMessage());
+        } finally {
+            // 关闭所有资源
+            try {
+                if (outputStreamWriter != null) {
+                    outputStreamWriter.close();
+                }
+                if (outputStream != null) {
+                    outputStream.close();
+                }
+                if (bufferedReader != null) {
+                    bufferedReader.close();
+                }
+                if (inputStream != null) {
+                    inputStream.close();
+                }
+                if (runProcess != null && runProcess.isAlive()) {
+                    runProcess.destroy();
+                }
+            } catch (IOException e) {
+                // 忽略关闭资源时的异常
+            }
         }
         return executeMessage;
     }

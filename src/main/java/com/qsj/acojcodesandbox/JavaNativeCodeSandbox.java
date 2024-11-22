@@ -23,7 +23,7 @@ import java.util.*;
 public class JavaNativeCodeSandbox implements CodeSandbox {
     private static final String GLOBAL_CODE_DIR_NAME = "tmpCode";
     private static final String GLOBAL_JAVA_CLASS_NAME = "Main.java";
-    private static final long TIME_OUT = 10000L;
+    private static final long TIME_OUT = 3103L;
 
     @Override
     public ExecuteCodeResponse executeCode(ExecuteCodeRequest executeCodeRequest) {
@@ -63,18 +63,16 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
         for (String inputArg : inputList) {
             String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main", userCodeParentPath);
             try {
-                // 先启动进程
                 Process runProcess = Runtime.getRuntime().exec(runCmd);
-
-                // 创建内存跟踪器并传入进程
                 MemoryTracker memoryTracker = new MemoryTracker(runProcess);
                 memoryTracker.start();
 
-                // 执行进程并获取结果
                 ExecuteMessage runMessage = ProcessUtils.runInteractProcessAndGetMessage(runProcess, inputArg);
 
-                // 停止监控并获取结果
                 memoryTracker.stop();
+                if (memoryTracker.isTimeout()) {
+                    runMessage.setTime(TIME_OUT);
+                }
                 runMessage.setMemory(memoryTracker.getMaxMemoryUsage());
                 executeMessageList.add(runMessage);
             } catch (Exception e) {
@@ -89,6 +87,9 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
             if (StrUtil.isNotBlank(executeMessage.getErrorMessage())) {
                 executeCodeResponse.setMessage(executeMessage.getErrorMessage());
                 executeCodeResponse.setStatue(3);
+                if (executeMessage.getTime() >= TIME_OUT * 2) {
+                    time = executeMessage.getTime();
+                }
                 break;
             }
             time = Math.max(time, executeMessage.getTime());
@@ -130,12 +131,16 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
         private Long processId = null;
         private final long startTime;
         private volatile boolean hasStartedMonitoring = false;
+        private static final long TIMEOUT_MS = 3000; // 10秒超时
+        private final long startExecuteTime;
+        private boolean isTimeout = false;
 
         public MemoryTracker(Process process) {
             this.process = process;
             this.systemInfo = new SystemInfo();
             this.os = systemInfo.getOperatingSystem();
             this.startTime = System.currentTimeMillis();
+            this.startExecuteTime = System.currentTimeMillis();
         }
 
         private void findJavaProcess() {
@@ -161,7 +166,6 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
         }
 
         public void start() {
-            // 确保进程已经启动
             try {
                 Thread.sleep(50);
                 findJavaProcess();
@@ -170,13 +174,38 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
                 return;
             }
 
+            // 创建超时检查线程
+            Thread timeoutThread = new Thread(() -> {
+                try {
+                    Thread.sleep(TIMEOUT_MS);
+                    if (process.isAlive()) {
+                        System.out.println("程序运行超时，强制终止");
+                        isTimeout = true;
+                        process.destroy();
+                        isRunning = false;
+                    }
+                } catch (InterruptedException e) {
+                    // 忽略中断异常
+                }
+            });
+            timeoutThread.setDaemon(true);
+            timeoutThread.start();
+
             monitorThread = new Thread(() -> {
                 try {
                     if (processId != null) {
                         System.out.println("开始监控进程内存，进程ID: " + processId);
                         int retryCount = 0;
 
-                        while (isRunning && process.isAlive() && retryCount < 10) { // 增加重试次数
+                        while (isRunning && process.isAlive() && retryCount < 10) {
+                            // 检查是否超时
+                            if (System.currentTimeMillis() - startExecuteTime > TIMEOUT_MS) {
+                                System.out.println("执行时间超过限制，终止进程");
+                                isTimeout = true;
+                                process.destroy();
+                                break;
+                            }
+
                             try {
                                 OSProcess osProcess = os.getProcess((int) (long) processId);
                                 if (osProcess != null) {
@@ -185,14 +214,14 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
                                         hasStartedMonitoring = true;
                                         System.out.println("当前物理内存使用: " + formatMemorySize(currentMemory));
                                         maxMemoryUsage = Math.max(maxMemoryUsage, currentMemory);
-                                        retryCount = 0; // 重置重试计数
+                                        retryCount = 0;
                                     } else {
                                         retryCount++;
                                     }
                                 } else {
                                     retryCount++;
                                 }
-                                Thread.sleep(10); // 缩短采样间隔
+                                Thread.sleep(10);
                             } catch (Exception e) {
                                 System.out.println("内存采样异常: " + e.getMessage());
                                 retryCount++;
@@ -210,27 +239,18 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
                     e.printStackTrace();
                 }
             });
+            monitorThread.setDaemon(true);
             monitorThread.start();
         }
 
         public void stop() {
             try {
-                // 确保监控线程有足够的时间收集数据
-                if (!hasStartedMonitoring) {
-                    Thread.sleep(200);
-                }
-
-                if (processId != null) {
-                    // 在停止前多次采样
-                    for (int i = 0; i < 10; i++) {
-                        OSProcess osProcess = os.getProcess((int) (long) processId);
-                        if (osProcess != null) {
-                            long currentMemory = osProcess.getResidentSetSize() / 1024;
-                            if (currentMemory > 0) {
-                                maxMemoryUsage = Math.max(maxMemoryUsage, currentMemory);
-                            }
-                        }
-                        Thread.sleep(10);
+                // 如果进程还在运行，强制终止
+                if (process.isAlive()) {
+                    process.destroy();
+                    // 如果普通的destroy()不起作用，使用destroyForcibly()
+                    if (process.isAlive()) {
+                        process.destroyForcibly();
                     }
                 }
 
@@ -256,6 +276,10 @@ public class JavaNativeCodeSandbox implements CodeSandbox {
             } else {
                 return String.format("%.2f GB", sizeInKB / (1024.0 * 1024.0));
             }
+        }
+
+        public boolean isTimeout() {
+            return isTimeout;
         }
     }
 
